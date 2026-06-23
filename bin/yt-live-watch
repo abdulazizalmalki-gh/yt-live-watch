@@ -1,0 +1,1144 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+CONFIG_FILE="${CONFIG_FILE:-$HOME/.config/yt-live-watch/config.env}"
+if [[ -f "$CONFIG_FILE" ]]; then
+  # shellcheck source=/dev/null
+  source "$CONFIG_FILE"
+fi
+
+DEFAULT_URL="https://www.youtube.com/watch?v=L6wO1-U2RTY"
+
+VLM_URL="${VLM_URL:-http://localhost:18080/v1/chat/completions}"
+VLM_MODEL="${VLM_MODEL:-auto}"
+
+QUALITY="${QUALITY:-720p,best}"
+WIDTH="${WIDTH:-960}"
+HASH_DIFF="${HASH_DIFF:-6}"
+MAX_TOKENS="${MAX_TOKENS:-300}"
+HEADER_MODE="${HEADER_MODE:-auto}"
+
+FRAME_INTERVAL="${FRAME_INTERVAL:-5}"
+FPS="${FPS:-1/$FRAME_INTERVAL}"
+
+WORKDIR="${WORKDIR:-$HOME/yt-live-visual}"
+BASE_FRAMES_DIR="$WORKDIR/frames"
+ANALYSIS_DIR="$WORKDIR/analysis"
+STATE_DIR="$WORKDIR/runs"
+LOG_DIR="$WORKDIR/logs"
+RUNTIME_DIR="$WORKDIR/runtime"
+VENV_DIR="$WORKDIR/.venv"
+
+SCRIPT_PATH="$(readlink -f "$0")"
+CLI_FRAMES=""
+
+mkdir -p "$BASE_FRAMES_DIR" "$ANALYSIS_DIR" "$STATE_DIR" "$LOG_DIR" "$RUNTIME_DIR"
+
+usage() {
+  cat <<EOF
+Usage:
+  yt-live-watch start "YOUTUBE_URL"
+  yt-live-watch start "YOUTUBE_URL" --frames 3
+  yt-live-watch start "YOUTUBE_URL" --frames 3 "CUSTOM INSTRUCTION"
+
+  yt-live-watch "YOUTUBE_URL" start --frames 3
+  yt-live-watch stop
+  yt-live-watch status
+
+Foreground:
+  yt-live-watch "YOUTUBE_URL" --frames 3
+
+Env:
+  HEADER_MODE=auto|live|elapsed
+  VLM_URL=http://localhost:18080/v1/chat/completions
+EOF
+}
+
+need_cmd() {
+  command -v "$1" >/dev/null 2>&1 || {
+    echo "[missing] $1" >&2
+    return 1
+  }
+}
+
+check_deps() {
+  local missing=0
+
+  need_cmd ffmpeg || missing=1
+  need_cmd python3 || missing=1
+
+  if ! command -v streamlink >/dev/null 2>&1 && ! command -v yt-dlp >/dev/null 2>&1; then
+    echo "[missing] Need either streamlink or yt-dlp" >&2
+    missing=1
+  fi
+
+  if [[ "$missing" -eq 1 ]]; then
+    echo "[error] Missing dependencies. Run install_yt_live_watch.sh again." >&2
+    exit 1
+  fi
+}
+
+normalize_frames_value() {
+  local value="$1"
+
+  if ! [[ "$value" =~ ^[0-9]+$ ]]; then
+    echo "[error] --frames must be an integer. Example: --frames 3" >&2
+    exit 1
+  fi
+
+  if (( value < 3 )); then
+    value=3
+  fi
+
+  printf '%s\n' "$value"
+}
+
+apply_frames_override() {
+  if [[ -n "$CLI_FRAMES" ]]; then
+    FRAME_INTERVAL="$CLI_FRAMES"
+  else
+    FRAME_INTERVAL="$(normalize_frames_value "$FRAME_INTERVAL")"
+  fi
+
+  FPS="1/$FRAME_INTERVAL"
+}
+
+parse_url_instruction_options() {
+  TARGET_URL="$DEFAULT_URL"
+  CUSTOM_INSTRUCTION="${ANALYSIS_INSTRUCTION:-}"
+
+  local url_set=0
+  local parts=()
+
+  while (($#)); do
+    case "$1" in
+      --frames)
+        (($# >= 2)) || { echo "[error] --frames requires a value." >&2; exit 1; }
+        CLI_FRAMES="$(normalize_frames_value "$2")"
+        shift 2
+        ;;
+      --frames=*)
+        CLI_FRAMES="$(normalize_frames_value "${1#--frames=}")"
+        shift
+        ;;
+      *)
+        if (( url_set == 0 )); then
+          TARGET_URL="$1"
+          url_set=1
+        else
+          parts+=("$1")
+        fi
+        shift
+        ;;
+    esac
+  done
+
+  CUSTOM_INSTRUCTION="${parts[*]}"
+  CUSTOM_INSTRUCTION="${CUSTOM_INSTRUCTION:-${ANALYSIS_INSTRUCTION:-}}"
+}
+
+parse_instruction_options_only() {
+  CUSTOM_INSTRUCTION="${ANALYSIS_INSTRUCTION:-}"
+  local parts=()
+
+  while (($#)); do
+    case "$1" in
+      --frames)
+        (($# >= 2)) || { echo "[error] --frames requires a value." >&2; exit 1; }
+        CLI_FRAMES="$(normalize_frames_value "$2")"
+        shift 2
+        ;;
+      --frames=*)
+        CLI_FRAMES="$(normalize_frames_value "${1#--frames=}")"
+        shift
+        ;;
+      *)
+        parts+=("$1")
+        shift
+        ;;
+    esac
+  done
+
+  CUSTOM_INSTRUCTION="${parts[*]}"
+  CUSTOM_INSTRUCTION="${CUSTOM_INSTRUCTION:-${ANALYSIS_INSTRUCTION:-}}"
+}
+
+compute_video_key() {
+  local url="$1"
+
+  python3 - "$url" <<'PY'
+import hashlib
+import re
+import sys
+from urllib.parse import urlparse, parse_qs
+
+url = sys.argv[1]
+p = urlparse(url)
+host = p.netloc.lower()
+q = parse_qs(p.query)
+video_id = ""
+
+if "youtube.com" in host and q.get("v"):
+    video_id = q["v"][0]
+elif "youtu.be" in host:
+    video_id = p.path.strip("/").split("/")[0]
+elif p.path:
+    parts = [x for x in p.path.split("/") if x]
+    video_id = parts[-1] if parts else ""
+
+video_id = re.sub(r"[^A-Za-z0-9._-]+", "_", video_id).strip("_")
+
+if not video_id:
+    video_id = "video_" + hashlib.sha1(url.encode()).hexdigest()[:12]
+
+print(video_id)
+PY
+}
+
+get_video_title() {
+  local url="$1"
+  local fallback="$2"
+  local title=""
+
+  if command -v yt-dlp >/dev/null 2>&1; then
+    title="$(yt-dlp --no-warnings --get-title "$url" 2>/dev/null | head -n 1 || true)"
+  fi
+
+  [[ -n "$title" ]] || title="Unknown title ($fallback)"
+  printf '%s\n' "$title"
+}
+
+get_live_status() {
+  local url="$1"
+  local status="unknown"
+
+  if command -v yt-dlp >/dev/null 2>&1; then
+    status="$(yt-dlp --no-warnings --print "%(live_status)s" "$url" 2>/dev/null | head -n 1 || true)"
+  fi
+
+  if [[ -z "$status" || "$status" == "NA" ]]; then
+    status="unknown"
+  fi
+
+  printf '%s\n' "$status"
+}
+
+resolve_header_mode() {
+  local live_status="$1"
+  local requested="${HEADER_MODE:-auto}"
+
+  case "$requested" in
+    live|elapsed)
+      printf '%s\n' "$requested"
+      return 0
+      ;;
+  esac
+
+  case "$live_status" in
+    is_live|is_upcoming)
+      printf '%s\n' "live"
+      ;;
+    *)
+      printf '%s\n' "elapsed"
+      ;;
+  esac
+}
+
+b64_encode() { printf '%s' "$1" | base64 -w0; }
+b64_decode() { printf '%s' "$1" | base64 -d 2>/dev/null || true; }
+
+shorten() {
+  local text
+  text="$(printf '%s' "$1" | tr '\n' ' ' | sed 's/[[:space:]][[:space:]]*/ /g')"
+
+  if (( ${#text} > 160 )); then
+    printf '%s...\n' "${text:0:160}"
+  else
+    printf '%s\n' "$text"
+  fi
+}
+
+is_running_instance() {
+  local pid="$1"
+
+  [[ -n "$pid" ]] || return 1
+  kill -0 "$pid" 2>/dev/null || return 1
+
+  if [[ -r "/proc/$pid/cmdline" ]]; then
+    local cmdline
+    cmdline="$(tr '\0' ' ' < "/proc/$pid/cmdline" 2>/dev/null || true)"
+    [[ -z "$cmdline" || "$cmdline" == *"__run"* ]] || return 1
+  fi
+
+  return 0
+}
+
+write_meta() {
+  local pid="$1"
+  local url="$2"
+  local title="$3"
+  local video_key="$4"
+  local output_file="$5"
+  local log_file="$6"
+  local started="$7"
+  local instruction="$8"
+  local run_id="$9"
+  local live_status="${10}"
+  local header_mode="${11}"
+  local frame_interval="${12}"
+
+  cat > "$STATE_DIR/$pid.meta" <<EOF
+PID="$pid"
+STARTED="$started"
+URL_B64="$(b64_encode "$url")"
+TITLE_B64="$(b64_encode "$title")"
+VIDEO_KEY_B64="$(b64_encode "$video_key")"
+OUTPUT_FILE_B64="$(b64_encode "$output_file")"
+LOG_FILE_B64="$(b64_encode "$log_file")"
+INSTRUCTION_B64="$(b64_encode "$instruction")"
+RUN_ID_B64="$(b64_encode "$run_id")"
+LIVE_STATUS_B64="$(b64_encode "$live_status")"
+HEADER_MODE_B64="$(b64_encode "$header_mode")"
+FRAME_INTERVAL_B64="$(b64_encode "$frame_interval")"
+EOF
+}
+
+load_running_instances() {
+  local filter="${1:-}"
+  local filter_lc
+  filter_lc="$(printf '%s' "$filter" | tr '[:upper:]' '[:lower:]')"
+
+  RUN_PIDS=()
+  RUN_META_FILES=()
+  RUN_TITLES=()
+  RUN_VIDEO_KEYS=()
+  RUN_OUTPUT_FILES=()
+  RUN_LOG_FILES=()
+  RUN_STARTED=()
+  RUN_INSTRUCTIONS=()
+  RUN_IDS=()
+  RUN_LIVE_STATUSES=()
+  RUN_HEADER_MODES=()
+  RUN_FRAME_INTERVALS=()
+
+  shopt -s nullglob
+
+  for meta in "$STATE_DIR"/*.meta; do
+    unset PID STARTED URL_B64 TITLE_B64 VIDEO_KEY_B64 OUTPUT_FILE_B64 LOG_FILE_B64 INSTRUCTION_B64 RUN_ID_B64 LIVE_STATUS_B64 HEADER_MODE_B64 FRAME_INTERVAL_B64
+
+    # shellcheck disable=SC1090
+    source "$meta" || true
+
+    if ! is_running_instance "${PID:-}"; then
+      rm -f "$meta"
+      continue
+    fi
+
+    local title video_key output_file log_file instruction run_id live_status header_mode frame_interval
+    title="$(b64_decode "${TITLE_B64:-}")"
+    video_key="$(b64_decode "${VIDEO_KEY_B64:-}")"
+    output_file="$(b64_decode "${OUTPUT_FILE_B64:-}")"
+    log_file="$(b64_decode "${LOG_FILE_B64:-}")"
+    instruction="$(b64_decode "${INSTRUCTION_B64:-}")"
+    run_id="$(b64_decode "${RUN_ID_B64:-}")"
+    live_status="$(b64_decode "${LIVE_STATUS_B64:-}")"
+    header_mode="$(b64_decode "${HEADER_MODE_B64:-}")"
+    frame_interval="$(b64_decode "${FRAME_INTERVAL_B64:-}")"
+
+    if [[ -n "$filter_lc" ]]; then
+      local haystack
+      haystack="$(printf '%s\n%s\n%s\n%s\n%s\n%s' "$title" "$video_key" "$instruction" "$run_id" "$live_status" "$header_mode" | tr '[:upper:]' '[:lower:]')"
+      [[ "$haystack" == *"$filter_lc"* ]] || continue
+    fi
+
+    RUN_PIDS+=("$PID")
+    RUN_META_FILES+=("$meta")
+    RUN_TITLES+=("$title")
+    RUN_VIDEO_KEYS+=("$video_key")
+    RUN_OUTPUT_FILES+=("$output_file")
+    RUN_LOG_FILES+=("$log_file")
+    RUN_STARTED+=("${STARTED:-unknown}")
+    RUN_INSTRUCTIONS+=("$instruction")
+    RUN_IDS+=("$run_id")
+    RUN_LIVE_STATUSES+=("$live_status")
+    RUN_HEADER_MODES+=("$header_mode")
+    RUN_FRAME_INTERVALS+=("${frame_interval:-unknown}")
+  done
+}
+
+print_running_instances() {
+  local filter="${1:-}"
+  load_running_instances "$filter"
+
+  if [[ "${#RUN_PIDS[@]}" -eq 0 ]]; then
+    echo "[info] No running instances."
+    return 1
+  fi
+
+  echo "[info] Running instances:"
+  echo
+
+  local i
+  for i in "${!RUN_PIDS[@]}"; do
+    local n=$((i + 1))
+    echo "[$n] ${RUN_TITLES[$i]}"
+    echo "    PID: ${RUN_PIDS[$i]}"
+    echo "    Started: ${RUN_STARTED[$i]}"
+    echo "    Video key: ${RUN_VIDEO_KEYS[$i]}"
+    echo "    Run ID: ${RUN_IDS[$i]}"
+    echo "    Live status: ${RUN_LIVE_STATUSES[$i]}"
+    echo "    Header mode: ${RUN_HEADER_MODES[$i]}"
+    echo "    Frame interval: ${RUN_FRAME_INTERVALS[$i]}s"
+    echo "    Output: ${RUN_OUTPUT_FILES[$i]}"
+    echo "    Log: ${RUN_LOG_FILES[$i]}"
+
+    if [[ -n "${RUN_INSTRUCTIONS[$i]}" ]]; then
+      echo "    Instruction: $(shorten "${RUN_INSTRUCTIONS[$i]}")"
+    fi
+
+    echo
+  done
+
+  return 0
+}
+
+status_instances() {
+  print_running_instances "${1:-}" || true
+}
+
+stop_instance_interactive() {
+  local filter="${1:-}"
+
+  if ! print_running_instances "$filter"; then
+    return 0
+  fi
+
+  local choice
+
+  if [[ "${#RUN_PIDS[@]}" -eq 1 ]]; then
+    read -r -p "Stop this instance? [y/N]: " choice
+    [[ "$choice" == "y" || "$choice" == "Y" ]] || { echo "[info] Cancelled."; return 0; }
+    choice=1
+  else
+    read -r -p "Choose instance number to stop, or q to cancel: " choice
+    [[ "$choice" != "q" && "$choice" != "Q" ]] || { echo "[info] Cancelled."; return 0; }
+  fi
+
+  [[ "$choice" =~ ^[0-9]+$ ]] || { echo "[error] Not a valid number." >&2; exit 1; }
+
+  local index=$((choice - 1))
+  (( index >= 0 && index < ${#RUN_PIDS[@]} )) || { echo "[error] Choice out of range." >&2; exit 1; }
+
+  local pid="${RUN_PIDS[$index]}"
+  local meta="${RUN_META_FILES[$index]}"
+
+  echo "[info] Stopping PID: $pid"
+
+  kill -TERM -- "-$pid" 2>/dev/null || kill -TERM "$pid" 2>/dev/null || true
+  sleep 2
+
+  if kill -0 "$pid" 2>/dev/null; then
+    echo "[warn] Still running, forcing stop..."
+    kill -KILL -- "-$pid" 2>/dev/null || kill -KILL "$pid" 2>/dev/null || true
+  fi
+
+  rm -f "$meta"
+  echo "[info] Stopped."
+}
+
+start_instance() {
+  local url="$1"
+  local custom_instruction="${2:-}"
+
+  check_deps
+
+  command -v setsid >/dev/null 2>&1 || {
+    echo "[error] setsid missing. Install util-linux." >&2
+    exit 1
+  }
+
+  local video_key title timestamp started output_file log_file pid run_id live_status resolved_header_mode
+
+  video_key="$(compute_video_key "$url")"
+  title="$(get_video_title "$url" "$video_key")"
+  live_status="$(get_live_status "$url")"
+  resolved_header_mode="$(resolve_header_mode "$live_status")"
+
+  timestamp="$(date +%Y%m%d_%H%M%S)"
+  started="$(date '+%Y-%m-%d %H:%M:%S')"
+  run_id="${video_key}_${timestamp}_${RANDOM}"
+
+  output_file="${OUTPUT_FILE:-$ANALYSIS_DIR/${video_key}_analysis.txt}"
+  log_file="$LOG_DIR/${video_key}_${timestamp}.log"
+
+  mkdir -p "$(dirname "$output_file")" "$(dirname "$log_file")"
+
+  echo "[info] Starting in background..."
+  echo "[info] Title: $title"
+  echo "[info] URL: $url"
+  echo "[info] Live status: $live_status"
+  echo "[info] Header mode: $resolved_header_mode"
+  echo "[info] Frame interval: ${FRAME_INTERVAL}s"
+  echo "[info] Output: $output_file"
+  echo "[info] Log: $log_file"
+  echo "[info] Existing analysis file will be replaced."
+
+  if [[ -n "$custom_instruction" ]]; then
+    echo "[info] Custom instruction: $(shorten "$custom_instruction")"
+  fi
+
+  export VLM_URL VLM_MODEL QUALITY FPS WIDTH HASH_DIFF MAX_TOKENS
+  export HEADER_MODE="$resolved_header_mode"
+  export WORKDIR OUTPUT_FILE="$output_file"
+  export ANALYSIS_INSTRUCTION="$custom_instruction"
+  export RUN_ID="$run_id"
+  export VIDEO_TITLE="$title"
+  export VIDEO_URL="$url"
+  export VIDEO_KEY="$video_key"
+  export VIDEO_LIVE_STATUS="$live_status"
+  export FRAME_INTERVAL
+
+  nohup setsid "$SCRIPT_PATH" __run "$url" >> "$log_file" 2>&1 < /dev/null &
+  pid="$!"
+
+  sleep 1
+
+  if ! kill -0 "$pid" 2>/dev/null; then
+    echo "[error] Failed to start. Last log lines:" >&2
+    tail -n 80 "$log_file" || true
+    exit 1
+  fi
+
+  write_meta "$pid" "$url" "$title" "$video_key" "$output_file" "$log_file" "$started" "$custom_instruction" "$run_id" "$live_status" "$resolved_header_mode" "$FRAME_INTERVAL"
+
+  echo
+  echo "[info] Started."
+  echo "[info] PID: $pid"
+  echo
+  echo "Watch output:"
+  echo "  tail -f \"$output_file\""
+  echo
+  echo "Watch logs:"
+  echo "  tail -f \"$log_file\""
+}
+
+run_pipeline() {
+  local URL="$1"
+  local custom_instruction="${2:-${ANALYSIS_INSTRUCTION:-}}"
+
+  check_deps
+
+  local VIDEO_KEY_LOCAL VIDEO_TITLE_LOCAL LIVE_STATUS_LOCAL HEADER_MODE_LOCAL RUN_ID_LOCAL FRAMES_DIR RUN_RUNTIME_DIR PY_APP
+
+  VIDEO_KEY_LOCAL="${VIDEO_KEY:-$(compute_video_key "$URL")}"
+  VIDEO_TITLE_LOCAL="${VIDEO_TITLE:-$(get_video_title "$URL" "$VIDEO_KEY_LOCAL")}"
+  LIVE_STATUS_LOCAL="${VIDEO_LIVE_STATUS:-$(get_live_status "$URL")}"
+  HEADER_MODE_LOCAL="$(resolve_header_mode "$LIVE_STATUS_LOCAL")"
+
+  RUN_ID_LOCAL="${RUN_ID:-${VIDEO_KEY_LOCAL}_fg_$$}"
+  FRAMES_DIR="$BASE_FRAMES_DIR/$RUN_ID_LOCAL"
+  RUN_RUNTIME_DIR="$RUNTIME_DIR/$RUN_ID_LOCAL"
+  PY_APP="$RUN_RUNTIME_DIR/watch_frames.py"
+
+  OUTPUT_FILE="${OUTPUT_FILE:-$ANALYSIS_DIR/${VIDEO_KEY_LOCAL}_analysis.txt}"
+
+  mkdir -p "$FRAMES_DIR" "$RUN_RUNTIME_DIR" "$(dirname "$OUTPUT_FILE")"
+
+  echo "[info] Workdir: $WORKDIR"
+  echo "[info] YouTube title: $VIDEO_TITLE_LOCAL"
+  echo "[info] Video key: $VIDEO_KEY_LOCAL"
+  echo "[info] Live status: $LIVE_STATUS_LOCAL"
+  echo "[info] Header mode: $HEADER_MODE_LOCAL"
+  echo "[info] Frame interval: ${FRAME_INTERVAL}s"
+  echo "[info] Output file: $OUTPUT_FILE"
+  echo "[info] Frames dir: $FRAMES_DIR"
+  echo "[info] FPS setting: $FPS"
+
+  if [[ ! -d "$VENV_DIR" ]]; then
+    echo "[info] Creating Python venv..."
+    python3 -m venv "$VENV_DIR"
+  fi
+
+  # shellcheck source=/dev/null
+  source "$VENV_DIR/bin/activate"
+
+  python3 - <<'PY'
+import importlib.util
+import subprocess
+import sys
+
+needed = {"requests": "requests", "PIL": "pillow"}
+missing = []
+
+for module, package in needed.items():
+    if importlib.util.find_spec(module) is None:
+        missing.append(package)
+
+if missing:
+    print("[info] Installing Python packages:", " ".join(missing))
+    subprocess.check_call([sys.executable, "-m", "pip", "install", "-U", *missing])
+PY
+
+  cat > "$PY_APP" <<'PY'
+import base64
+import os
+import re
+import time
+from pathlib import Path
+from datetime import datetime
+
+import requests
+from PIL import Image
+
+FRAMES_DIR = Path(os.environ.get("FRAMES_DIR", "frames"))
+OUTPUT_FILE = Path(os.environ.get("OUTPUT_FILE", "live_analysis.txt"))
+
+RAW_VLM_URL = os.environ.get("VLM_URL", "http://localhost:18080/v1/chat/completions").rstrip("/")
+MODEL_ENV = os.environ.get("VLM_MODEL", "auto").strip()
+CUSTOM_INSTRUCTION = os.environ.get("ANALYSIS_INSTRUCTION", "").strip()
+
+VIDEO_TITLE = os.environ.get("VIDEO_TITLE", "").strip()
+VIDEO_URL = os.environ.get("VIDEO_URL", "").strip()
+VIDEO_KEY = os.environ.get("VIDEO_KEY", "").strip()
+RUN_ID = os.environ.get("RUN_ID", "").strip()
+VIDEO_LIVE_STATUS = os.environ.get("VIDEO_LIVE_STATUS", "unknown").strip()
+HEADER_MODE = os.environ.get("HEADER_MODE", "elapsed").strip()
+
+HASH_DIFF = int(os.environ.get("HASH_DIFF", "6"))
+MAX_TOKENS = int(os.environ.get("MAX_TOKENS", "300"))
+FPS_EXPR = os.environ.get("FPS", "1/5").strip()
+FRAME_INTERVAL_ENV = os.environ.get("FRAME_INTERVAL", "").strip()
+
+seen = set()
+last_hash = None
+memory = []
+no_content_count = 0
+
+
+def parse_fps_interval_seconds(expr: str) -> float:
+    try:
+        expr = expr.strip()
+        if "/" in expr:
+            left, right = expr.split("/", 1)
+            numerator = float(left.strip())
+            denominator = float(right.strip())
+            if numerator <= 0:
+                return 5.0
+            return denominator / numerator
+
+        fps = float(expr)
+        if fps <= 0:
+            return 5.0
+        return 1.0 / fps
+    except Exception:
+        return 5.0
+
+
+FRAME_INTERVAL_SECONDS = parse_fps_interval_seconds(FPS_EXPR)
+
+
+def fmt_num(value) -> str:
+    try:
+        return f"{float(value):g}"
+    except Exception:
+        return str(value)
+
+
+DISPLAY_FRAME_INTERVAL = FRAME_INTERVAL_ENV if FRAME_INTERVAL_ENV else fmt_num(FRAME_INTERVAL_SECONDS)
+
+
+def frame_number_from_name(path: Path) -> int:
+    match = re.search(r"frame_(\d+)\.jpg$", path.name)
+    if not match:
+        return 1
+    return int(match.group(1))
+
+
+def format_elapsed(seconds: float) -> str:
+    if seconds < 0:
+        seconds = 0
+
+    whole = int(seconds)
+    millis = int(round((seconds - whole) * 1000))
+
+    if millis >= 1000:
+        whole += 1
+        millis = 0
+
+    h = whole // 3600
+    m = (whole % 3600) // 60
+    s = whole % 60
+
+    if millis:
+        return f"{h:02d}:{m:02d}:{s:02d}.{millis:03d}"
+
+    return f"{h:02d}:{m:02d}:{s:02d}"
+
+
+def elapsed_for_frame(path: Path) -> str:
+    frame_num = frame_number_from_name(path)
+    elapsed = max(0, frame_num - 1) * FRAME_INTERVAL_SECONDS
+    return format_elapsed(elapsed)
+
+
+def header_for_frame(path: Path) -> str:
+    if HEADER_MODE == "live":
+        return f"[{path.name}]"
+    return f"[{elapsed_for_frame(path)}] {path.name}"
+
+
+def reset_output_file() -> None:
+    OUTPUT_FILE.parent.mkdir(parents=True, exist_ok=True)
+    OUTPUT_FILE.write_text("", encoding="utf-8")
+
+
+def append_to_file(text: str) -> None:
+    OUTPUT_FILE.parent.mkdir(parents=True, exist_ok=True)
+    with OUTPUT_FILE.open("a", encoding="utf-8") as f:
+        f.write(text)
+        if not text.endswith("\n"):
+            f.write("\n")
+
+
+def safe_delete(path: Path) -> None:
+    try:
+        if path.exists():
+            path.unlink()
+    except Exception as e:
+        print(f"[warn] Could not delete {path.name}: {e}", flush=True)
+
+
+def normalize_chat_url(url: str) -> str:
+    url = url.rstrip("/")
+    if url.endswith("/v1/chat/completions"):
+        return url
+    if url.endswith("/v1"):
+        return url + "/chat/completions"
+    if url.endswith("/chat/completions"):
+        return url
+    return url + "/v1/chat/completions"
+
+
+def models_url_from_chat_url(chat_url: str) -> str:
+    if chat_url.endswith("/chat/completions"):
+        return chat_url[: -len("/chat/completions")] + "/models"
+    return chat_url.rstrip("/") + "/models"
+
+
+VLM_URL = normalize_chat_url(RAW_VLM_URL)
+MODELS_URL = models_url_from_chat_url(VLM_URL)
+
+
+def resolve_model() -> str:
+    if MODEL_ENV and MODEL_ENV.lower() != "auto":
+        print(f"[info] Using manual model: {MODEL_ENV}", flush=True)
+        return MODEL_ENV
+
+    print(f"[info] Auto-detecting model from: {MODELS_URL}", flush=True)
+
+    r = requests.get(MODELS_URL, timeout=20)
+    r.raise_for_status()
+    data = r.json()
+
+    ids = [
+        m.get("id")
+        for m in data.get("data", [])
+        if isinstance(m, dict) and m.get("id")
+    ]
+
+    if not ids:
+        raise RuntimeError(f"No model ids found in /v1/models response: {data}")
+
+    model = ids[0]
+    print(f"[info] Detected model: {model}", flush=True)
+    return model
+
+
+MODEL = resolve_model()
+
+
+def avg_hash(path: Path) -> int:
+    img = Image.open(path).convert("L").resize((8, 8))
+
+    if hasattr(img, "get_flattened_data"):
+        pixels = list(img.get_flattened_data())
+    else:
+        pixels = list(img.getdata())
+
+    avg = sum(pixels) / len(pixels)
+
+    bits = 0
+    for i, px in enumerate(pixels):
+        if px > avg:
+            bits |= 1 << i
+
+    return bits
+
+
+def hamming(a: int, b: int) -> int:
+    return (a ^ b).bit_count()
+
+
+def image_to_data_url(path: Path) -> str:
+    encoded = base64.b64encode(path.read_bytes()).decode("utf-8")
+    return f"data:image/jpeg;base64,{encoded}"
+
+
+def extract_content(data: dict) -> str:
+    global no_content_count
+
+    try:
+        choice = data["choices"][0]
+        msg = choice.get("message", {})
+    except Exception:
+        print("[server-weird] Could not parse choices/message:", flush=True)
+        print(data, flush=True)
+        return "SKIP"
+
+    content = msg.get("content")
+    reasoning_content = msg.get("reasoning_content")
+
+    if content is None:
+        content = reasoning_content
+
+    if isinstance(content, list):
+        parts = []
+        for item in content:
+            if isinstance(item, dict) and item.get("text"):
+                parts.append(str(item.get("text")))
+            elif item:
+                parts.append(str(item))
+        content = "\n".join(parts)
+
+    if content is None:
+        no_content_count += 1
+
+        if no_content_count <= 3:
+            print("", flush=True)
+            print("[server-weird] VLM returned no content.", flush=True)
+            print("[server-weird] Usually text-only model or multimodal disabled.", flush=True)
+            print(msg, flush=True)
+            print("", flush=True)
+
+        return "SKIP"
+
+    content = str(content).strip()
+    return content if content else "SKIP"
+
+
+def post_chat(payload: dict) -> dict:
+    r = requests.post(VLM_URL, json=payload, timeout=180)
+
+    if r.status_code >= 400:
+        body = r.text[:4000]
+
+        minimal_payload = {
+            "model": payload["model"],
+            "messages": payload["messages"],
+            "temperature": payload.get("temperature", 0.1),
+            "max_tokens": payload.get("max_tokens", MAX_TOKENS),
+        }
+
+        r2 = requests.post(VLM_URL, json=minimal_payload, timeout=180)
+
+        if r2.status_code >= 400:
+            print("", flush=True)
+            print(f"[server-error] HTTP {r.status_code} from {VLM_URL}", flush=True)
+            print(body, flush=True)
+            print("", flush=True)
+            print(f"[server-error] Retry HTTP {r2.status_code}", flush=True)
+            print(r2.text[:4000], flush=True)
+            print("", flush=True)
+            raise RuntimeError("VLM server rejected the image request.")
+
+        return r2.json()
+
+    return r.json()
+
+
+def build_prompt() -> str:
+    known = "\n".join(memory[-25:]) if memory else "Nothing yet."
+
+    if CUSTOM_INSTRUCTION:
+        custom_block = f"""
+User custom instruction:
+{CUSTOM_INSTRUCTION}
+
+The custom instruction controls what visual changes matter and the output format.
+Obey it unless it conflicts with these hard rules:
+- Output only NEW meaningful information.
+- Do not repeat previous outputs.
+- If nothing useful changed, output exactly: SKIP
+"""
+    else:
+        custom_block = """
+No custom instruction was provided.
+
+Default behavior:
+- Describe the meaningful visual scene in concise bullet points.
+- Focus on what is happening, where it appears to be, and any meaningful visible changes.
+- Mention visible text only when it helps explain the scene.
+- Do not output raw OCR word lists.
+- Do not list random signs, shop names, or repeated text unless they are clearly important.
+- If the frame is just similar storefronts, repeated street signs, or nothing meaningfully new, output exactly: SKIP
+
+Default output format:
+• ...
+• ...
+"""
+
+    return f"""
+You are watching a YouTube stream/video visually only.
+
+Previous useful outputs:
+{known}
+
+Analyze this new frame.
+
+{custom_block}
+
+Hard rules:
+- Output only final text that should be printed and saved.
+- Do not explain reasoning.
+- Do not mention analyzing a frame.
+- Do not describe boring unchanged visuals.
+- If nothing useful changed, output exactly: SKIP
+"""
+
+
+def ask_vlm(path: Path) -> str:
+    payload = {
+        "model": MODEL,
+        "messages": [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": build_prompt()},
+                    {"type": "image_url", "image_url": {"url": image_to_data_url(path)}},
+                ],
+            }
+        ],
+        "temperature": 0.1,
+        "max_tokens": MAX_TOKENS,
+        "chat_template_kwargs": {"enable_thinking": False},
+        "tool_choice": "none",
+    }
+
+    return extract_content(post_chat(payload))
+
+
+print("[info] Analyzer started. Waiting for frames...")
+print("[info] Press Ctrl+C to stop.")
+print(f"[info] Output file: {OUTPUT_FILE}")
+print("[info] Output file reset: yes")
+print(f"[info] Live status: {VIDEO_LIVE_STATUS}")
+print(f"[info] Header mode: {HEADER_MODE}")
+print(f"[info] Frame interval: {DISPLAY_FRAME_INTERVAL}s")
+
+if VIDEO_TITLE:
+    print(f"[info] Video title: {VIDEO_TITLE}")
+
+if CUSTOM_INSTRUCTION:
+    print(f"[info] Custom instruction active: {CUSTOM_INSTRUCTION}")
+
+print()
+
+reset_output_file()
+
+append_to_file("============================================================")
+append_to_file(f"Video title: {VIDEO_TITLE or 'Unknown title'}")
+append_to_file(f"Video URL: {VIDEO_URL or 'Unknown URL'}")
+append_to_file(f"Video key: {VIDEO_KEY or 'Unknown key'}")
+append_to_file(f"Run ID: {RUN_ID or 'Unknown run'}")
+append_to_file(f"Live status: {VIDEO_LIVE_STATUS}")
+append_to_file(f"Header mode: {HEADER_MODE}")
+append_to_file(f"Frame interval: {DISPLAY_FRAME_INTERVAL}s")
+
+if HEADER_MODE == "elapsed":
+    append_to_file(f"FPS setting: {FPS_EXPR}")
+    append_to_file(f"Saved frame interval: {fmt_num(FRAME_INTERVAL_SECONDS)}s")
+
+append_to_file(f"Session started: {datetime.now().isoformat(timespec='seconds')}")
+append_to_file(f"Model: {MODEL}")
+
+if CUSTOM_INSTRUCTION:
+    append_to_file("Custom instruction:")
+    append_to_file(CUSTOM_INSTRUCTION)
+
+append_to_file("============================================================")
+append_to_file("")
+
+while True:
+    frames = sorted(FRAMES_DIR.glob("*.jpg"))
+
+    for frame in frames:
+        if frame in seen:
+            safe_delete(frame)
+            continue
+
+        seen.add(frame)
+        should_delete = True
+
+        try:
+            size1 = frame.stat().st_size
+            time.sleep(0.2)
+            size2 = frame.stat().st_size
+
+            if size1 != size2 or size2 == 0:
+                seen.discard(frame)
+                should_delete = False
+                continue
+
+            current_hash = avg_hash(frame)
+
+            if last_hash is not None:
+                diff = hamming(last_hash, current_hash)
+                if diff < HASH_DIFF:
+                    last_hash = current_hash
+                    continue
+
+            last_hash = current_hash
+
+            result = ask_vlm(frame)
+
+            if result and result.strip() != "SKIP":
+                header = header_for_frame(frame)
+
+                print(header, flush=True)
+                print(result, flush=True)
+                print("", flush=True)
+
+                append_to_file(header)
+                append_to_file(result)
+                append_to_file("")
+
+                memory.append(result.strip())
+                memory[:] = memory[-25:]
+
+        except Exception as e:
+            print(f"[error] {frame.name}: {e}", flush=True)
+
+        finally:
+            if should_delete:
+                safe_delete(frame)
+
+    time.sleep(1)
+PY
+
+  cleanup() {
+    echo
+    echo "[info] Stopping..."
+
+    jobs -p | xargs -r kill 2>/dev/null || true
+
+    if [[ -n "${FRAMES_DIR:-}" && -d "${FRAMES_DIR:-}" ]]; then
+      rm -rf "$FRAMES_DIR" 2>/dev/null || true
+    fi
+
+    if [[ -n "${RUN_RUNTIME_DIR:-}" && -d "${RUN_RUNTIME_DIR:-}" ]]; then
+      rm -rf "$RUN_RUNTIME_DIR" 2>/dev/null || true
+    fi
+  }
+
+  trap cleanup EXIT INT TERM
+
+  rm -f "$FRAMES_DIR"/*.jpg 2>/dev/null || true
+
+  echo "[info] Starting frame capture..."
+
+  if command -v streamlink >/dev/null 2>&1; then
+    streamlink --stdout "$URL" "$QUALITY" \
+      | ffmpeg -hide_banner -loglevel warning \
+          -i pipe:0 \
+          -vf "fps=$FPS,scale=$WIDTH:-1" \
+          -q:v 3 \
+          "$FRAMES_DIR/frame_%08d.jpg" &
+  else
+    STREAM_URL="$(yt-dlp -f "best[height<=720]/best" -g "$URL" | head -n 1)"
+
+    ffmpeg -hide_banner -loglevel warning \
+      -i "$STREAM_URL" \
+      -vf "fps=$FPS,scale=$WIDTH:-1" \
+      -q:v 3 \
+      "$FRAMES_DIR/frame_%08d.jpg" &
+  fi
+
+  CAPTURE_PID=$!
+
+  echo "[info] Capture PID: $CAPTURE_PID"
+  echo "[info] Starting analyzer..."
+  echo
+
+  export FRAMES_DIR OUTPUT_FILE VLM_URL VLM_MODEL HASH_DIFF MAX_TOKENS
+  export ANALYSIS_INSTRUCTION="$custom_instruction"
+  export FPS VIDEO_TITLE="$VIDEO_TITLE_LOCAL" VIDEO_URL="$URL" VIDEO_KEY="$VIDEO_KEY_LOCAL"
+  export RUN_ID="$RUN_ID_LOCAL" VIDEO_LIVE_STATUS="$LIVE_STATUS_LOCAL" HEADER_MODE="$HEADER_MODE_LOCAL"
+  export FRAME_INTERVAL
+
+  python3 "$PY_APP"
+}
+
+ACTION="run"
+TARGET_URL="$DEFAULT_URL"
+CUSTOM_INSTRUCTION="${ANALYSIS_INSTRUCTION:-}"
+FILTER_TEXT=""
+
+if (($# == 0)); then
+  ACTION="run"
+  TARGET_URL="$DEFAULT_URL"
+else
+  case "${1:-}" in
+    start)
+      ACTION="start"
+      shift
+      parse_url_instruction_options "$@"
+      ;;
+    stop)
+      ACTION="stop"
+      shift
+      FILTER_TEXT="$*"
+      ;;
+    status|list)
+      ACTION="status"
+      shift
+      FILTER_TEXT="$*"
+      ;;
+    __run)
+      ACTION="run"
+      TARGET_URL="${2:-$DEFAULT_URL}"
+      CUSTOM_INSTRUCTION="${ANALYSIS_INSTRUCTION:-}"
+      ;;
+    help|-h|--help)
+      usage
+      exit 0
+      ;;
+    *)
+      if [[ "${2:-}" == "start" ]]; then
+        ACTION="start"
+        TARGET_URL="$1"
+        shift 2
+        parse_instruction_options_only "$@"
+      else
+        ACTION="run"
+        parse_url_instruction_options "$@"
+      fi
+      ;;
+  esac
+fi
+
+apply_frames_override
+
+case "$ACTION" in
+  start)
+    start_instance "$TARGET_URL" "$CUSTOM_INSTRUCTION"
+    ;;
+  stop)
+    stop_instance_interactive "$FILTER_TEXT"
+    ;;
+  status)
+    status_instances "$FILTER_TEXT"
+    ;;
+  run)
+    run_pipeline "$TARGET_URL" "$CUSTOM_INSTRUCTION"
+    ;;
+esac
