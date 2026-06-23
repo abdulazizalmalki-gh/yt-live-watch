@@ -7,7 +7,7 @@ if [[ -f "$CONFIG_FILE" ]]; then
   source "$CONFIG_FILE"
 fi
 
-DEFAULT_URL="https://www.youtube.com/watch?v=L6wO1-U2RTY"
+DEFAULT_URL=""
 
 VLM_URL="${VLM_URL:-http://localhost:18080/v1/chat/completions}"
 VLM_MODEL="${VLM_MODEL:-auto}"

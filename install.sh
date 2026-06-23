@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-REPO="${REPO:-YOUR_GITHUB_USERNAME/yt-live-watch}"
+REPO="${REPO:-abdulazizalmalki-gh/yt-live-watch}"
 BRANCH="${BRANCH:-main}"
 RAW_BASE="https://raw.githubusercontent.com/$REPO/$BRANCH"
 
