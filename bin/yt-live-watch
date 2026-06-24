@@ -45,9 +45,6 @@ Usage:
   yt-live-watch stop
   yt-live-watch status
 
-Foreground:
-  yt-live-watch "YOUTUBE_URL" --frames 3
-
 Env:
   HEADER_MODE=auto|live|elapsed
   VLM_URL=http://localhost:18080/v1/chat/completions
@@ -1084,8 +1081,8 @@ CUSTOM_INSTRUCTION="${ANALYSIS_INSTRUCTION:-}"
 FILTER_TEXT=""
 
 if (($# == 0)); then
-  ACTION="run"
-  TARGET_URL="$DEFAULT_URL"
+  usage
+  exit 1
 else
   case "${1:-}" in
     start)
@@ -1113,15 +1110,8 @@ else
       exit 0
       ;;
     *)
-      if [[ "${2:-}" == "start" ]]; then
-        ACTION="start"
-        TARGET_URL="$1"
-        shift 2
-        parse_instruction_options_only "$@"
-      else
-        ACTION="run"
-        parse_url_instruction_options "$@"
-      fi
+      ACTION="start"
+      parse_url_instruction_options "$@"
       ;;
   esac
 fi
@@ -1137,8 +1127,5 @@ case "$ACTION" in
     ;;
   status)
     status_instances "$FILTER_TEXT"
-    ;;
-  run)
-    run_pipeline "$TARGET_URL" "$CUSTOM_INSTRUCTION"
     ;;
 esac

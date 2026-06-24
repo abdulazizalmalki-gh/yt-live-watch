@@ -7,7 +7,7 @@ Watch YouTube live streams locally and get AI-powered frame-by-frame analysis in
 - Captures frames from a live YouTube stream at configurable intervals
 - Sends each frame to your local AI server (VLM) for analysis
 - Aggregates insights into a running analysis file
-- Runs multiple streams in parallel (background mode)
+- Runs multiple streams in parallel as background processes
 
 ## Prerequisites
 
@@ -30,6 +30,8 @@ The installer will:
 
 ## Usage
 
+All instances run in the background. Watch output with `tail -f` on the analysis file (path printed on start).
+
 ### Start watching a live stream
 
 ```bash
@@ -48,23 +50,21 @@ yt-live-watch start "https://www.youtube.com/watch?v=VIDEO_ID" --frames 3
 yt-live-watch start "https://www.youtube.com/watch?v=VIDEO_ID" --frames 5 "Describe what's happening and summarize key moments"
 ```
 
-### Foreground mode
-
-```bash
-yt-live-watch "https://www.youtube.com/watch?v=VIDEO_ID" --frames 3
-```
-
 ### Stop a running instance
 
 ```bash
 yt-live-watch stop
 ```
 
+Interactively choose which instance to stop. If only one is running, it stops immediately on confirmation.
+
 ### Check status of running instances
 
 ```bash
 yt-live-watch status
 ```
+
+Shows PID, start time, video title, output file path, and other metadata for each active instance. `list` is an alias for `status`.
 
 ## Configuration
 
