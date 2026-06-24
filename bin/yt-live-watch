@@ -1128,4 +1128,7 @@ case "$ACTION" in
   status)
     status_instances "$FILTER_TEXT"
     ;;
+  run)
+    run_pipeline "$TARGET_URL" "$CUSTOM_INSTRUCTION"
+    ;;
 esac
