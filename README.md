@@ -118,6 +118,10 @@ Re-run the installer to upgrade:
 bash <(curl -fsSL https://raw.githubusercontent.com/abdulazizalmalki-gh/yt-live-watch/main/install.sh)
 ```
 
+## Disclaimer
+
+Not affiliated with or endorsed by YouTube or Google. "YouTube" is a trademark of Google LLC. Use responsibly.
+
 ## License
 
 MIT
