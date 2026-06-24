@@ -13,6 +13,7 @@ Watch YouTube live streams locally and get AI-powered frame-by-frame analysis in
 
 - **Linux** (tested on Ubuntu/Debian, Fedora, Arch)
 - **Local AI server** with OpenAI-compatible API (e.g., llama.cpp, Ollama)
+- **A vision-capable model** (multimodal/VLM) — text-only models won't work
 - `ffmpeg`, `python3`, `pipx`, `curl`
 
 ## Quick install
