@@ -872,12 +872,16 @@ Obey it unless it conflicts with these hard rules:
 No custom instruction was provided.
 
 Default behavior:
-- Describe the meaningful visual scene in concise bullet points.
-- Focus on what is happening, where it appears to be, and any meaningful visible changes.
-- Mention visible text only when it helps explain the scene.
-- Do not output raw OCR word lists.
-- Do not list random signs, shop names, or repeated text unless they are clearly important.
-- If the frame is just similar storefronts, repeated street signs, or nothing meaningfully new, output exactly: SKIP
+- Describe everything you see in this frame as concisely as possible.
+- What is happening? Where is it? Who is visible? What objects, text, or
+  UI elements appear on screen?
+- Include all visible text. Prefer short quotes rather than long OCR dumps.
+- When the scene is visually near-identical to what you described previously,
+  output exactly: SKIP
+- For screen recordings (code, terminals, dashboards, charts, UI), describe
+  what changed.
+- For real-world scenes, describe the environment, people, actions, and any
+  notable detail.
 
 Default output format:
 • ...
