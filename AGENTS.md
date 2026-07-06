@@ -100,7 +100,7 @@ bash <(curl -fsSL https://raw.githubusercontent.com/abdulazizalmalki-gh/yt-live-
 yt-live-watch start "https://www.youtube.com/watch?v=VIDEO_ID" --frames 3
 
 # Start with custom VLM endpoint
-yt-live-watch start "https://www.youtube.com/watch?v=VIDEO_ID" --vlm-url http://host:18080/v1
+yt-live-watch start "https://www.youtube.com/watch?v=VIDEO_ID" --vlm-url http://host:port/v1
 
 # Start TTS on the analysis
 ./live_tts.sh start       # auto-detect latest analysis file
