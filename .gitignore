@@ -1,0 +1,5 @@
+# TTS generated/runtime artifacts
+tts-entries.json
+tts-audio/
+tts-runs/
+tts-venv/
