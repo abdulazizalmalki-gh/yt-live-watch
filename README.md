@@ -158,9 +158,15 @@ Configure speed via `TTS_SPEED` env var (default `1.25`).
 
 ### Requirements
 
-- `python3`, `ffmpeg`, `espeak-ng`, `mpv` (for `--play`), `docker` (for `--html` serve)
-- Installs `kokoro>=0.9.2`, `soundfile`, `numpy` into a local venv at `tts-venv/`
-- GPU: auto-detects NVIDIA GPUs and installs CUDA torch; picks the GPU with the most free VRAM on each generation. Falls back to CPU if no GPU available.
+The script auto-installs missing system packages via apt, dnf, or pacman. The only manual prerequisite is `docker` when using `--html` / `serve`.
+
+| Dependency | Handled by |
+|---|---|
+| `python3`, `ffmpeg`, `espeak-ng` | `install_deps()` — auto-installs if missing |
+| `mpv` | `install_deps()` — auto-installs if `--play` is active |
+| `kokoro`, `soundfile`, `numpy` | `setup_venv()` — pip install into local `tts-venv/` |
+| CUDA torch | `setup_venv()` — auto-installs when NVIDIA GPU detected; falls back to CPU torch |
+| `docker` | **Manual** — required for `--html` / `serve` (nginx container)
 
 ### How it works
 
