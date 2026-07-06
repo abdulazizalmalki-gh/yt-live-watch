@@ -111,6 +111,56 @@ FRAME_INTERVAL=3 VLM_MODEL="qwen3.6-27b" yt-live-watch start "URL"
   .venv/           # Python virtual environment
 ```
 
+## TTS (Text-to-Speech)
+
+Speak live AI analysis out loud or stream it to a browser with Kokoro TTS.
+
+### Quick start
+
+```bash
+# Start watching analysis + speak entries (default: play + html)
+./live_tts.sh start
+
+# With custom voice and speed
+./live_tts.sh start ~/yt-live-visual/analysis/VIDEO_KEY_analysis.txt af_bella
+```
+
+### Modes
+
+| Flag | Description |
+|---|---|
+| `--play` | Play audio through system speakers via mpv |
+| `--html` | Serve a browser feed at `http://<host>:8080/tts-feed.html` via nginx container |
+| (default) | Both modes active |
+
+### Commands
+
+```bash
+./live_tts.sh start [--html] [--play] [file] [voice]   # Start TTS worker
+./live_tts.sh stop                                      # Stop running worker
+./live_tts.sh status                                    # Show running workers
+./live_tts.sh serve                                     # Start nginx container only
+```
+
+### Voices
+
+`af_heart` (default), `af_bella`, `af_sarah`, `am_adam`, `am_michael`, `bf_emma`, `bf_isabella`, `bm_george`, `bm_lewis`
+
+Configure speed via `TTS_SPEED` env var (default `1.25`).
+
+### Requirements
+
+- `python3`, `ffmpeg`, `espeak-ng`, `mpv` (for `--play`), `docker` (for `--html` serve)
+- Installs `kokoro>=0.9.2`, `soundfile`, `numpy` into a local venv at `tts-venv/`
+
+### How it works
+
+1. `tail -F` watches the analysis file for new entries
+2. Parses frame blocks (bullet points joined into sentences)
+3. Generates WAV via Kokoro TTS, converts to MP3
+4. Plays via mpv (`--play`) and/or appends to browser feed (`--html`)
+5. Browser feed auto-polls `tts-entries.json` every 3s — exclusive playback, green card on active
+
 ## Updating
 
 Re-run the installer to upgrade:
