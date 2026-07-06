@@ -144,11 +144,13 @@ Speak live AI analysis out loud or stream it to a browser with Kokoro TTS.
 ### Commands
 
 ```bash
-./live_tts.sh start [--html] [--play] [file] [voice]   # Start TTS worker
+./live_tts.sh start [--html] [--play] [file] [voice]   # Start TTS worker (--html auto-starts nginx)
 ./live_tts.sh stop                                      # Stop running worker
 ./live_tts.sh status                                    # Show running workers
-./live_tts.sh serve                                     # Start nginx container only
+./live_tts.sh serve                                     # Start nginx container standalone (no worker)
 ```
+
+`serve` is for when you want the browser feed without a running TTS worker — e.g., browsing already-generated entries or after stopping the worker. When you use `start --html`, the nginx container is started automatically.
 
 ### Voices
 
