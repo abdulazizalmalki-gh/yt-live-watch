@@ -1,6 +1,4 @@
 #!/usr/bin/env python3
-import os
-os.environ["CUDA_VISIBLE_DEVICES"] = ""
 import sys, numpy as np, soundfile as sf
 from kokoro import KPipeline
 text = sys.stdin.read().strip()

@@ -40,10 +40,16 @@ Usage:
   yt-live-watch start "YOUTUBE_URL"
   yt-live-watch start "YOUTUBE_URL" --frames 3
   yt-live-watch start "YOUTUBE_URL" --frames 3 "CUSTOM INSTRUCTION"
+  yt-live-watch start "YOUTUBE_URL" --vlm-url http://host:port/v1
 
   yt-live-watch "YOUTUBE_URL" start --frames 3
   yt-live-watch stop
   yt-live-watch status
+
+Options:
+  --frames N           Frame interval in seconds (default: 5, min: 3)
+  --vlm-url URL        Custom VLM endpoint (format: http://host:port/v1)
+                       Overrides VLM_URL from config
 
 Env:
   HEADER_MODE=auto|live|elapsed
@@ -118,6 +124,17 @@ parse_url_instruction_options() {
         CLI_FRAMES="$(normalize_frames_value "${1#--frames=}")"
         shift
         ;;
+      --vlm-url)
+        (($# >= 2)) || { echo "[error] --vlm-url requires a value." >&2; exit 1; }
+        export VLM_URL="$2"
+        VLM_URL_CLI="$2"
+        shift 2
+        ;;
+      --vlm-url=*)
+        export VLM_URL="${1#--vlm-url=}"
+        VLM_URL_CLI="${1#--vlm-url=}"
+        shift
+        ;;
       *)
         if (( url_set == 0 )); then
           TARGET_URL="$1"
@@ -147,6 +164,15 @@ parse_instruction_options_only() {
         ;;
       --frames=*)
         CLI_FRAMES="$(normalize_frames_value "${1#--frames=}")"
+        shift
+        ;;
+      --vlm-url)
+        (($# >= 2)) || { echo "[error] --vlm-url requires a value." >&2; exit 1; }
+        export VLM_URL="$2"
+        shift 2
+        ;;
+      --vlm-url=*)
+        export VLM_URL="${1#--vlm-url=}"
         shift
         ;;
       *)
@@ -495,7 +521,13 @@ start_instance() {
   export VIDEO_LIVE_STATUS="$live_status"
   export FRAME_INTERVAL
 
-  nohup setsid "$SCRIPT_PATH" __run "$url" >> "$log_file" 2>&1 < /dev/null &
+  # Pass --vlm-url through so the child re-parses it after config sourcing
+  local vlm_url_args=()
+  if [[ -n "${VLM_URL_CLI:-}" ]]; then
+    vlm_url_args=(--vlm-url "$VLM_URL_CLI")
+  fi
+
+  nohup setsid "$SCRIPT_PATH" __run "$url" "${vlm_url_args[@]}" >> "$log_file" 2>&1 < /dev/null &
   pid="$!"
 
   sleep 1
@@ -1107,7 +1139,8 @@ else
     __run)
       ACTION="run"
       TARGET_URL="${2:-$DEFAULT_URL}"
-      CUSTOM_INSTRUCTION="${ANALYSIS_INSTRUCTION:-}"
+      shift 2
+      parse_instruction_options_only "$@"
       ;;
     help|-h|--help)
       usage

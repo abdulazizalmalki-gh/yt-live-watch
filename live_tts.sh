@@ -106,8 +106,23 @@ setup_venv() {
     python -m pip install -U pip -q 2>/dev/null || true
     python -c 'import kokoro; import soundfile; import numpy' 2>/dev/null || {
         info "Installing kokoro..."
-        python -m pip install -U "kokoro>=0.9.2" soundfile numpy
+        if command -v nvidia-smi >/dev/null 2>&1 && nvidia-smi -L >/dev/null 2>&1; then
+            info "GPU detected — installing CUDA torch"
+            python -m pip install -U "kokoro>=0.9.2" soundfile numpy \
+                --extra-index-url https://download.pytorch.org/whl/cu126
+        else
+            python -m pip install -U "kokoro>=0.9.2" soundfile numpy
+        fi
     }
+    # Reinstall torch with CUDA if GPU is available but CPU torch is installed
+    if command -v nvidia-smi >/dev/null 2>&1 && nvidia-smi -L >/dev/null 2>&1; then
+        if python -c 'import torch; assert torch.cuda.is_available()' 2>/dev/null; then
+            : # CUDA torch already installed
+        else
+            info "GPU available but CPU torch installed — upgrading to CUDA torch"
+            python -m pip install -U torch --extra-index-url https://download.pytorch.org/whl/cu126
+        fi
+    fi
 }
 
 create_tts_script() {
@@ -115,8 +130,6 @@ create_tts_script() {
     info "Creating TTS helper: $TTS_PY"
     cat > "$TTS_PY" <<'PYEOF'
 #!/usr/bin/env python3
-import os
-os.environ["CUDA_VISIBLE_DEVICES"] = ""
 import sys, numpy as np, soundfile as sf
 from kokoro import KPipeline
 text = sys.stdin.read().strip()
@@ -132,6 +145,23 @@ PYEOF
     chmod +x "$TTS_PY"
 }
 
+# ── GPU selection ──────────────────────────────────────────────
+
+pick_gpu() {
+    # Return the GPU index with the most free memory.
+    # Falls back to "" (no restriction) if nvidia-smi is unavailable.
+    if ! command -v nvidia-smi >/dev/null 2>&1; then
+        return 1  # no GPU
+    fi
+    local best
+    best="$(nvidia-smi --query-gpu=index,memory.free --format=csv,noheader,nounits 2>/dev/null \
+        | sort -t, -k2 -rn | head -1 | cut -d, -f1 | tr -d ' ')"
+    if [[ -z "$best" ]]; then
+        return 1
+    fi
+    printf '%s' "$best"
+}
+
 # ── TTS generation ────────────────────────────────────────────
 
 generate_mp3() {
@@ -142,10 +172,25 @@ generate_mp3() {
     local mp3="$AUDIO_DIR/${id}.mp3"
     mkdir -p "$AUDIO_DIR"
     source "$VENV_DIR/bin/activate"
-    export CUDA_VISIBLE_DEVICES=""
-    python3 "$TTS_PY" "$wav" "$VOICE" "$TTS_SPEED" <<< "$text"
-    unset CUDA_VISIBLE_DEVICES
-    ffmpeg -y -loglevel quiet -i "$wav" -codec:a libmp3lame -b:a 64k "$mp3"
+
+    # Pick the GPU with the most free VRAM
+    local gpu
+    if gpu="$(pick_gpu)"; then
+        export CUDA_VISIBLE_DEVICES="$gpu"
+    else
+        export CUDA_VISIBLE_DEVICES=""
+    fi
+
+    python3 "$TTS_PY" "$wav" "$VOICE" "$TTS_SPEED" <<< "$text" || {
+        warn "TTS generation failed for $id, skipping"
+        rm -f "$wav" "$mp3"
+        return 1
+    }
+    ffmpeg -y -loglevel quiet -i "$wav" -codec:a libmp3lame -b:a 64k "$mp3" || {
+        warn "MP3 conversion failed for $id, skipping"
+        rm -f "$wav" "$mp3"
+        return 1
+    }
     rm -f "$wav"
     printf '%s\n' "$mp3"
 }
@@ -330,9 +375,9 @@ run_worker() {
         init_html
     fi
 
-    # Speak last 3 existing frames as warm-up
-    info "Speaking last 3 frames..."
-    parse_analysis "$ANALYSIS_FILE" true "tail -3" | while IFS= read -r block; do
+    # Speak all existing frames as warm-up
+    info "Speaking existing frames..."
+    parse_analysis "$ANALYSIS_FILE" true "cat" | while IFS= read -r block; do
         output_block "$block"
     done
 
