@@ -45,20 +45,24 @@ Key env vars: `VLM_URL`, `VLM_MODEL`, `WIDTH`, `HASH_DIFF`, `MAX_TOKENS`, `FRAME
 
 CLI flags: `--frames N`, `--vlm-url http://host:port/v1`
 
+The `--vlm-url` flag is passed through to the `__run` child process as a
+command-line argument so it survives `config.env` re-sourcing in the child —
+unlike an exported env var which would be clobbered.
+
 ## TTS pipeline (live_tts.sh)
 
 Commands: `start`, `stop`, `status`, `serve`
 
 The start command spawns a background worker that:
 1. Auto-detects the latest `*_analysis.txt` file (or accepts one as arg)
-2. Installs deps + creates a local venv at `tts-venv/`
-3. Parses analysis file via `awk`: skips header (two `====` separators), extracts bullet-point blocks per frame entry
-4. Pipe each block through `tts_kokoro.py` → WAV → ffmpeg → MP3 (64kbps)
-5. If `--play`: plays via `mpv --really-quiet` (backgrounded)
-6. If `--html`: appends to `tts-entries.json`, served by nginx:alpine container
-
-Worker watches the analysis file with `tail -n 0 -F` — new appends are picked up live.
-On startup, all existing frames are processed as warm-up (not just the last 3).
+2. Auto-installs missing system deps via apt/dnf/pacman, creates local venv
+3. Processes the analysis file via a unified `tail -n +1 -F` pipeline that
+   handles both existing frames and live appends in a single pass
+4. Detects frame headers with a lenient regex to survive `tail -F` line
+   fragmentation during active writes
+5. Pipe each frame block through `tts_kokoro.py` → WAV → ffmpeg → MP3 (64kbps)
+6. If `--play`: plays via `mpv --really-quiet` (backgrounded)
+7. If `--html`: appends to `tts-entries.json`, served by nginx:alpine container
 
 Config: `TTS_SPEED` (default 1.25), voice via positional arg (default `af_heart`)
 
@@ -86,9 +90,15 @@ Header mode (`live` vs `elapsed`) controls whether frames are labeled with `[HH:
 
 ## Dependencies
 
-System: `ffmpeg`, `python3`, `python3-venv`, `pipx`, `curl`, `util-linux` (setsid)
+System (auto-installed by `install_deps()` via apt/dnf/pacman if missing):
+`ffmpeg`, `python3`, `python3-venv`, `espeak-ng`, `mpv` (playback)
+
+Python (auto-installed by `setup_venv()` into local `tts-venv/`):
+`kokoro>=0.9.2`, `soundfile`, `numpy`, torch (CUDA if GPU detected, else CPU)
+
 Stream capture: `streamlink` and/or `yt-dlp` (via pipx)
-TTS: `kokoro>=0.9.2`, `soundfile`, `numpy`, `espeak-ng`, `mpv` (playback), `docker` (serve)
+Manual: `docker` (required for `--html` / `serve` nginx container)
+System: `curl`, `util-linux` (setsid)
 
 ## Common workflows
 
