@@ -375,30 +375,45 @@ run_worker() {
         init_html
     fi
 
-    # Speak all existing frames as warm-up
-    info "Speaking existing frames..."
-    parse_analysis "$ANALYSIS_FILE" true "cat" | while IFS= read -r block; do
-        output_block "$block"
-    done
+    # Single unified pipeline: tail from start catches everything,
+    # tail -F handles truncation and live appends.
+    info "Processing analysis file... (Ctrl+C to stop)"
 
-    # Watch for new appends
-    info "Watching for new entries... (Ctrl+C to stop)"
     local buffer=""
     local header_done=false
     local seen_first_sep=false
+    local in_header=true
 
-    tail -n 0 -F "$ANALYSIS_FILE" | while IFS= read -r line; do
-        if ! $header_done; then
-            if [[ "$line" == "============================================================" ]]; then
-                $seen_first_sep && header_done=true || seen_first_sep=true
-                continue
+    tail -n +1 -F "$ANALYSIS_FILE" | while IFS= read -r line; do
+        # Detect file truncation (new header block)
+        if [[ "$line" == "============================================================" ]]; then
+            if $seen_first_sep; then
+                # Second separator in a header block = end of header
+                if $in_header; then
+                    in_header=false
+                else
+                    # Truncation detected: a new analysis run started
+                    info "File truncated — resetting parser"
+                    header_done=false
+                    seen_first_sep=false
+                    in_header=true
+                    buffer=""
+                fi
+            else
+                seen_first_sep=true
             fi
             continue
         fi
 
+        # Skip everything until header is done
+        if $in_header; then
+            continue
+        fi
+
+        # Now past the header — process frames
         if [[ "$line" =~ ^\[frame_[0-9]+\.jpg\]$ ]] || \
            [[ "$line" =~ ^\[[0-9:.]+\]\ frame_[0-9]+\.jpg$ ]]; then
-            [[ -n "$buffer" ]] && { info "New frame @ $(date +%H:%M:%S)"; output_block "$buffer"; buffer=""; }
+            [[ -n "$buffer" ]] && { output_block "$buffer"; buffer=""; }
             continue
         fi
 
