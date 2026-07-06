@@ -51,6 +51,14 @@ yt-live-watch start "https://www.youtube.com/watch?v=VIDEO_ID" --frames 3
 yt-live-watch start "https://www.youtube.com/watch?v=VIDEO_ID" --frames 5 "Describe what's happening and summarize key moments"
 ```
 
+### With a custom VLM endpoint
+
+```bash
+yt-live-watch start "https://www.youtube.com/watch?v=VIDEO_ID" --vlm-url http://myllm:18080/v1
+```
+
+Overrides `VLM_URL` from config. The URL can end in `/v1` or `/v1/chat/completions`. Works with `--frames` and custom instructions. Passed through to the background worker so it survives config re-sourcing.
+
 ### Stop a running instance
 
 ```bash
@@ -152,14 +160,17 @@ Configure speed via `TTS_SPEED` env var (default `1.25`).
 
 - `python3`, `ffmpeg`, `espeak-ng`, `mpv` (for `--play`), `docker` (for `--html` serve)
 - Installs `kokoro>=0.9.2`, `soundfile`, `numpy` into a local venv at `tts-venv/`
+- GPU: auto-detects NVIDIA GPUs and installs CUDA torch; picks the GPU with the most free VRAM on each generation. Falls back to CPU if no GPU available.
 
 ### How it works
 
-1. `tail -F` watches the analysis file for new entries
-2. Parses frame blocks (bullet points joined into sentences)
-3. Generates WAV via Kokoro TTS, converts to MP3
-4. Plays via mpv (`--play`) and/or appends to browser feed (`--html`)
-5. Browser feed auto-polls `tts-entries.json` every 3s — exclusive playback, green card on active
+1. On startup, processes all existing frames as warm-up (not just last 3)
+2. `tail -F` watches the analysis file for new entries
+3. Parses frame blocks (bullet points joined into sentences)
+4. Picks the GPU with the most free VRAM, generates WAV via Kokoro TTS, converts to MP3
+5. Failed generations are skipped with a warning — no stale JSON entries
+6. Plays via mpv (`--play`) and/or appends to browser feed (`--html`)
+7. Browser feed auto-polls `tts-entries.json` every 3s — exclusive playback, green card on active
 
 ## Updating
 

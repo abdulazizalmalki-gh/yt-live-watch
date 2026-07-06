@@ -43,6 +43,8 @@ Start spawns a background worker that:
 
 Key env vars: `VLM_URL`, `VLM_MODEL`, `WIDTH`, `HASH_DIFF`, `MAX_TOKENS`, `FRAME_INTERVAL`, `HEADER_MODE`, `QUALITY`
 
+CLI flags: `--frames N`, `--vlm-url http://host:port/v1`
+
 ## TTS pipeline (live_tts.sh)
 
 Commands: `start`, `stop`, `status`, `serve`
@@ -56,10 +58,13 @@ The start command spawns a background worker that:
 6. If `--html`: appends to `tts-entries.json`, served by nginx:alpine container
 
 Worker watches the analysis file with `tail -n 0 -F` — new appends are picked up live.
+On startup, all existing frames are processed as warm-up (not just the last 3).
 
 Config: `TTS_SPEED` (default 1.25), voice via positional arg (default `af_heart`)
 
-TTS deps require CUDA disabled: `CUDA_VISIBLE_DEVICES=""`
+GPU: `pick_gpu()` queries `nvidia-smi` for free VRAM and sets `CUDA_VISIBLE_DEVICES` to
+the GPU with the most headroom. Falls back to CPU if no GPU or nvidia-smi unavailable.
+Failed TTS/ffmpeg generations are skipped with a warning — no stale JSON entries.
 
 ## Analysis file format
 
@@ -93,6 +98,9 @@ bash <(curl -fsSL https://raw.githubusercontent.com/abdulazizalmalki-gh/yt-live-
 
 # Start watching a stream
 yt-live-watch start "https://www.youtube.com/watch?v=VIDEO_ID" --frames 3
+
+# Start with custom VLM endpoint
+yt-live-watch start "https://www.youtube.com/watch?v=VIDEO_ID" --vlm-url http://myllm:18080/v1
 
 # Start TTS on the analysis
 ./live_tts.sh start       # auto-detect latest analysis file
