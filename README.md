@@ -54,7 +54,7 @@ yt-live-watch start "https://www.youtube.com/watch?v=VIDEO_ID" --frames 5 "Descr
 ### With a custom VLM endpoint
 
 ```bash
-yt-live-watch start "https://www.youtube.com/watch?v=VIDEO_ID" --vlm-url http://myllm:18080/v1
+yt-live-watch start "https://www.youtube.com/watch?v=VIDEO_ID" --vlm-url http://host:18080/v1
 ```
 
 Overrides `VLM_URL` from config. The URL can end in `/v1` or `/v1/chat/completions`. Works with `--frames` and custom instructions. Passed through to the background worker so it survives config re-sourcing.
