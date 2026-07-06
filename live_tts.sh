@@ -380,7 +380,6 @@ run_worker() {
     info "Processing analysis file... (Ctrl+C to stop)"
 
     local buffer=""
-    local header_done=false
     local seen_first_sep=false
     local in_header=true
 
@@ -394,7 +393,6 @@ run_worker() {
                 else
                     # Truncation detected: a new analysis run started
                     info "File truncated — resetting parser"
-                    header_done=false
                     seen_first_sep=false
                     in_header=true
                     buffer=""
@@ -411,9 +409,15 @@ run_worker() {
         fi
 
         # Now past the header — process frames
-        if [[ "$line" =~ ^\[frame_[0-9]+\.jpg\]$ ]] || \
-           [[ "$line" =~ ^\[[0-9:.]+\]\ frame_[0-9]+\.jpg$ ]]; then
-            [[ -n "$buffer" ]] && { output_block "$buffer"; buffer=""; }
+        # Match frame headers anywhere in the line — tail -F can fragment them
+        # when the file is being actively written. Match any digit sequence
+        # ending in .jpg with optional trailing bracket.
+        if [[ "$line" =~ [0-9]{6,}\.jpg\]?$ ]]; then
+            # Flush buffer but skip if buffer is just a partial frame header
+            if [[ -n "$buffer" ]] && ! [[ "$buffer" =~ ^\[?f?r?a?m?e?_?[0-9]*$ ]]; then
+                output_block "$buffer"
+            fi
+            buffer=""
             continue
         fi
 
